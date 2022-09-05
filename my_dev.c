@@ -32,7 +32,6 @@
 #define LOW 			0
 #define HIGH 			1
 #define FLOWS 			2
-#define MAX_SEGMENT_SIZE	16 
 #define MAX_FLOW_SIZE		64
 
 
@@ -40,10 +39,10 @@ static int major;			// Major of Driver
 
 struct list_head flow[MINORS][FLOWS];	// High and Low Priority Flows
 
-struct node {				// Perfectly fits kmalloc() minimum chunck
-	struct list_head list;		// 8 + 8 Bytes
-	char data[MAX_SEGMENT_SIZE]; 	// 16 Bytes
-};					// Tot. 32 Bytes 
+struct node {				// Element of each Flow
+	struct list_head list;
+	char * data;
+};
 
 spinlock_t my_lock[MINORS][FLOWS];	// Lock to Synchronize Read/Write Ops
 
@@ -137,14 +136,10 @@ static ssize_t mydev_write(struct file *filp, const char __user *buff, size_t le
 	int minor = iminor(filp->f_path.dentry->d_inode);
 	struct node *temp_node = NULL;
 	
-	if (len > MAX_SEGMENT_SIZE) {
-		AUDIT { printk(KERN_WARNING "[%s][%d]: Tried to Write a Segment too big.\n", MODNAME, minor); }
-		return -EFBIG;
-	}
-	
 	// Allocate memory for the segment
 	temp_node = kmalloc(sizeof(struct node), GFP_KERNEL);
-	if (temp_node == NULL) {
+	temp_node->data = kmalloc(len * sizeof(char), GFP_KERNEL);
+	if (temp_node == NULL || temp_node->data == NULL) {
 		AUDIT { printk(KERN_WARNING "[%s][%d]: No Space Left on Device.\n", MODNAME, minor); }
 		return -ENOSPC;
 	}
@@ -152,7 +147,7 @@ static ssize_t mydev_write(struct file *filp, const char __user *buff, size_t le
 	INIT_LIST_HEAD(&temp_node->list);
 	
 	// Copy data from user space
-	if (copy_from_user(&temp_node->data, buff, len) != 0) {
+	if (copy_from_user(temp_node->data, buff, len) != 0) {
 		AUDIT { printk(KERN_WARNING "[%s][%d]: Failed to copy write value from user-space.\n", MODNAME, minor); }
 		kfree(temp_node);
 		return -EFAULT;
@@ -172,11 +167,11 @@ static ssize_t mydev_write(struct file *filp, const char __user *buff, size_t le
 			list_add_tail(&temp_node->list, &flow[minor][LOW]);
 		spin_unlock(&my_lock[minor][LOW]);
 		
-		__sync_fetch_and_add(&low_flows_size[minor], MAX_SEGMENT_SIZE);		
+		__sync_fetch_and_add(&low_flows_size[minor], len);		
 		__sync_fetch_and_sub(&waiting_threads_low[minor], 1);
 		wake_up(&my_wq[minor][LOW]);
 		
-		AUDIT { printk(KERN_INFO "[%s][%d][LOW]: Written %s.\n", MODNAME,  minor, (char *) &temp_node->data); }
+		AUDIT { printk(KERN_INFO "[%s][%d][LOW]: Written %s.\n", MODNAME,  minor, (char *) temp_node->data); }
 		
 		return len;
 		
@@ -193,11 +188,11 @@ static ssize_t mydev_write(struct file *filp, const char __user *buff, size_t le
 			list_add_tail(&temp_node->list, &flow[minor][HIGH]);
 		spin_unlock(&my_lock[minor][HIGH]);	
 		
-		__sync_fetch_and_add(&high_flows_size[minor], MAX_SEGMENT_SIZE);		
+		__sync_fetch_and_add(&high_flows_size[minor], len);		
 		__sync_fetch_and_sub(&waiting_threads_high[minor], 1);			
 		wake_up(&my_wq[minor][HIGH]);
 		
-		AUDIT { printk(KERN_INFO "[%s][%d][HIGH]: Written %s.\n", MODNAME, minor, (char *) &temp_node->data); }
+		AUDIT { printk(KERN_INFO "[%s][%d][HIGH]: Written %s.\n", MODNAME, minor, (char *) temp_node->data); }
 		
 		return len;
 		
@@ -232,11 +227,11 @@ static ssize_t mydev_read(struct file *filp, char __user *buff, size_t len, loff
     			list_del(&temp_node->list);
     		spin_unlock(&my_lock[minor][LOW]);	
     		
-    		__sync_fetch_and_sub(&low_flows_size[minor], MAX_SEGMENT_SIZE);
+    		__sync_fetch_and_sub(&low_flows_size[minor], strlen(temp_node->data));
     		__sync_fetch_and_sub(&waiting_threads_low[minor], 1);
 		wake_up(&my_wq[minor][LOW]); 
     		
-		AUDIT { printk(KERN_INFO "[%s][%d][LOW]: Read %s.\n", MODNAME, minor, (char *) &temp_node->data); }
+		AUDIT { printk(KERN_INFO "[%s][%d][LOW]: Read %s.\n", MODNAME, minor, (char *) temp_node->data); }
 	
 	} else if (priority[minor] == HIGH) {
 		__sync_fetch_and_add(&waiting_threads_high[minor], 1);
@@ -251,11 +246,11 @@ static ssize_t mydev_read(struct file *filp, char __user *buff, size_t len, loff
     			list_del(&temp_node->list);
     		spin_unlock(&my_lock[minor][HIGH]);
     		    		
-    		__sync_fetch_and_sub(&high_flows_size[minor], MAX_SEGMENT_SIZE);
+    		__sync_fetch_and_sub(&high_flows_size[minor], strlen(temp_node->data));
     		__sync_fetch_and_sub(&waiting_threads_high[minor], 1);
    		wake_up(&my_wq[minor][HIGH]); 
    		
-    		AUDIT { printk(KERN_INFO "[%s][%d][HIGH]: Read %s.\n", MODNAME, minor, (char *) &temp_node->data); }
+    		AUDIT { printk(KERN_INFO "[%s][%d][HIGH]: Read %s.\n", MODNAME, minor, (char *) temp_node->data); }
 
    	} else {
    		AUDIT { printk(KERN_WARNING "[%s][%d]: Default Flow is in a Bad State. Update it.\n", MODNAME, minor); }
@@ -263,14 +258,14 @@ static ssize_t mydev_read(struct file *filp, char __user *buff, size_t len, loff
 	}
 	
 	// Copy data to user space
-	if (copy_to_user(buff, &temp_node->data, sizeof(temp_node->data)) != 0) {
+	len = strlen(temp_node->data);
+	if (copy_to_user(buff, temp_node->data, len) != 0) {
 		AUDIT { printk(KERN_WARNING "[%s][%d]: Failed to copy read value from user-space.\n", MODNAME, minor); }
 		kfree(temp_node);
 		return -EFAULT;
 	}
 	
 	kfree(temp_node);
-	len = strlen(buff);
 	return len;
 }
 

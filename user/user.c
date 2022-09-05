@@ -12,7 +12,7 @@
 #define SET_WRITE_ASYNC		_IO('D',5)
 #define SET_WRITE_SYNC		_IO('D',6)
 #define SET_TIMEOUT		_IOW('D',6,long *)
-#define MAX_SEGMENT_SIZE	16
+#define MAX_SEGMENT_SIZE 	1024
 
 int main(int argc, char *argv[]) {
 /* Default User-Level Application to interact with MY_DEV */
