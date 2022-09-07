@@ -10,6 +10,7 @@
 #include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/wait.h>
+#include <linux/workqueue.h>
 
 
 
@@ -42,6 +43,13 @@ struct list_head flow[MINORS][FLOWS];	// High and Low Priority Flows
 struct node {				// Element of each Flow
 	struct list_head list;
 	char * data;
+};
+
+struct workqueue_struct * my_workqueue;	// Deferred Work Data Structures
+struct work_data {			
+	struct work_struct work;
+	struct node * temp_node;
+	int minor;
 };
 
 spinlock_t my_lock[MINORS][FLOWS];	// Lock to Synchronize Read/Write Ops
@@ -85,6 +93,30 @@ MODULE_PARM_DESC(waiting_threads_high, "A Read-Only array describing # of 	\
 		
 		
 			/* Device Driver File Operations */				
+void my_work_handler(struct work_struct * work) {
+/* Do the deferred write work. In other words, write bytes to the low queue and 
+   return # bytes written.
+*/
+	struct work_data *work_data;
+	struct node *temp_node;
+	int minor;
+	work_data = container_of(work, struct work_data, work);
+	temp_node = work_data->temp_node;
+	minor = work_data->minor;
+	 
+	__sync_fetch_and_add(&waiting_threads_low[minor], 1);
+	wait_event_idle_exclusive(my_wq[minor][LOW], low_flows_size[minor] < MAX_FLOW_SIZE);
+
+	spin_lock(&my_lock[minor][LOW]);
+		list_add_tail(&temp_node->list, &flow[minor][LOW]);
+	spin_unlock(&my_lock[minor][LOW]);
+	
+	__sync_fetch_and_add(&low_flows_size[minor], strlen(temp_node->data));		
+	__sync_fetch_and_sub(&waiting_threads_low[minor], 1);
+	wake_up(&my_wq[minor][LOW]);
+	
+	AUDIT { printk(KERN_INFO "[%s][%d][LOW]: Written %s.\n", MODNAME,  minor, (char *) temp_node->data); }
+}
 
 static int mydev_open(struct inode *, struct file *);
 static int mydev_close(struct inode *, struct file *);
@@ -155,28 +187,24 @@ static ssize_t mydev_write(struct file *filp, const char __user *buff, size_t le
 	
 	// Select right queue and add the segment
 	if (priority[minor] == LOW) {
-		// Asynchronous Write Op
-		__sync_fetch_and_add(&waiting_threads_low[minor], 1);
-		if (wait_event_interruptible_exclusive(my_wq[minor][LOW], low_flows_size[minor] < MAX_FLOW_SIZE) == -ERESTARTSYS) {
-			__sync_fetch_and_sub(&waiting_threads_low[minor], 1);
-			kfree(temp_node);
-			return 0;
+		// Asynchronous Write Op (Top Half)
+		struct work_data * my_work;
+		my_work = kmalloc(sizeof(struct work_data), GFP_KERNEL);
+		if (my_work == NULL) {
+			AUDIT { printk(KERN_WARNING "[%s][%d]: No Space Left on Device.\n", MODNAME, minor); }
+			return -ENOSPC;
 		}
-
-		spin_lock(&my_lock[minor][LOW]);
-			list_add_tail(&temp_node->list, &flow[minor][LOW]);
-		spin_unlock(&my_lock[minor][LOW]);
+		INIT_WORK(&my_work->work, my_work_handler);
+		my_work->temp_node = temp_node;
+		my_work->minor = minor;
 		
-		__sync_fetch_and_add(&low_flows_size[minor], len);		
-		__sync_fetch_and_sub(&waiting_threads_low[minor], 1);
-		wake_up(&my_wq[minor][LOW]);
-		
-		AUDIT { printk(KERN_INFO "[%s][%d][LOW]: Written %s.\n", MODNAME,  minor, (char *) temp_node->data); }
+		queue_work(my_workqueue, &my_work->work);
+		AUDIT { printk(KERN_INFO "[%s][%d][LOW]: Write Deferred - %s.\n", MODNAME,  minor, (char *) temp_node->data); }		
 		
 		return len;
 		
 	} else if (priority[minor] == HIGH) {
-		// Synchronous Write Op
+		// Synchronous Write Op	
 		__sync_fetch_and_add(&waiting_threads_high[minor], 1);
 		if (wait_event_idle_exclusive_timeout(my_wq[minor][HIGH], high_flows_size[minor] < MAX_FLOW_SIZE, timeout[minor]) == 0) {
 			__sync_fetch_and_sub(&waiting_threads_high[minor], 1);
@@ -349,6 +377,7 @@ int init_module(void) {
 	printk(KERN_INFO "[%s]: Device Driver Registered with Major %d.\n", MODNAME, major);
 	
 	// Init Devices & Data Structures
+	my_workqueue = create_workqueue("my_workqueue");
 	while (i < MINORS) {
 		INIT_LIST_HEAD(&flow[i][LOW]);
 		INIT_LIST_HEAD(&flow[i][HIGH]);
@@ -378,6 +407,8 @@ int init_module(void) {
 void cleanup_module(void) {
 /* Unregister the Device Driver	(Clean-up).
  */
+	flush_workqueue(my_workqueue);
+	destroy_workqueue(my_workqueue);
 	unregister_chrdev(major, DEVICE_NAME);
 	printk(KERN_INFO "[%s]: Device Driver with Major %d Unregistered Successfully.\n", MODNAME, major);
 }
