@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include <unistd.h>
 #include <string.h>
 #include <fcntl.h>
@@ -81,8 +83,9 @@ int main(int argc, char *argv[]) {
 			printf("Error: insert the write() data.\n");
 			return -1;
 		}
-
-		return write(fd, argv[3], strlen(argv[3]));
+		char *data;
+		asprintf(&data,"%s\n", argv[3]);
+		return write(fd, data, strlen(data));
 	
 	} else if (strcmp(argv[2], "read") == 0) {
 		// Manage Read Operation

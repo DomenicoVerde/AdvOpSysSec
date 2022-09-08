@@ -48,8 +48,8 @@ struct node {				// Element of each Flow
 struct workqueue_struct * my_workqueue;	// Deferred Work Data Structures
 struct work_data {			
 	struct work_struct work;
-	struct node * temp_node;
 	int minor;
+	struct node * temp_node;
 };
 
 spinlock_t my_lock[MINORS][FLOWS];	// Lock to Synchronize Read/Write Ops
@@ -93,25 +93,32 @@ MODULE_PARM_DESC(waiting_threads_high, "A Read-Only array describing # of 	\
 		
 		
 			/* Device Driver File Operations */				
-void my_work_handler(struct work_struct * work) {
-/* Do the deferred write work. In other words, write bytes to the low queue and 
-   return # bytes written.
+void my_write_handler(struct work_struct * work) {
+/* Do the deferred write work. In other words, write bytes to the low priority queue.
 */
 	struct work_data *work_data;
 	struct node *temp_node;
 	int minor;
+	size_t len;
 	work_data = container_of(work, struct work_data, work);
 	temp_node = work_data->temp_node;
 	minor = work_data->minor;
-	 
+	len = strlen(temp_node->data);
+
 	__sync_fetch_and_add(&waiting_threads_low[minor], 1);
-	wait_event_idle_exclusive(my_wq[minor][LOW], low_flows_size[minor] < MAX_FLOW_SIZE);
+
+	RETRY:
+	if (__sync_add_and_fetch(&low_flows_size[minor], len) > MAX_FLOW_SIZE) {
+		// If there is not enough space, wait
+		__sync_sub_and_fetch(&low_flows_size[minor], len);
+		wait_event_idle_exclusive(my_wq[minor][LOW], low_flows_size[minor] + len <= MAX_FLOW_SIZE);
+		goto RETRY;
+	}
 
 	spin_lock(&my_lock[minor][LOW]);
 		list_add_tail(&temp_node->list, &flow[minor][LOW]);
 	spin_unlock(&my_lock[minor][LOW]);
-	
-	__sync_fetch_and_add(&low_flows_size[minor], strlen(temp_node->data));		
+			
 	__sync_fetch_and_sub(&waiting_threads_low[minor], 1);
 	wake_up(&my_wq[minor][LOW]);
 	
@@ -167,6 +174,7 @@ static ssize_t mydev_write(struct file *filp, const char __user *buff, size_t le
  */	        
 	int minor = iminor(filp->f_path.dentry->d_inode);
 	struct node *temp_node = NULL;
+	long jiffies = timeout[minor];
 	
 	// Allocate memory for the segment
 	temp_node = kmalloc(sizeof(struct node), GFP_KERNEL);
@@ -194,7 +202,7 @@ static ssize_t mydev_write(struct file *filp, const char __user *buff, size_t le
 			AUDIT { printk(KERN_WARNING "[%s][%d]: No Space Left on Device.\n", MODNAME, minor); }
 			return -ENOSPC;
 		}
-		INIT_WORK(&my_work->work, my_work_handler);
+		INIT_WORK(&my_work->work, my_write_handler);
 		my_work->temp_node = temp_node;
 		my_work->minor = minor;
 		
@@ -206,17 +214,28 @@ static ssize_t mydev_write(struct file *filp, const char __user *buff, size_t le
 	} else if (priority[minor] == HIGH) {
 		// Synchronous Write Op	
 		__sync_fetch_and_add(&waiting_threads_high[minor], 1);
-		if (wait_event_idle_exclusive_timeout(my_wq[minor][HIGH], high_flows_size[minor] < MAX_FLOW_SIZE, timeout[minor]) == 0) {
-			__sync_fetch_and_sub(&waiting_threads_high[minor], 1);
-			kfree(temp_node);
-			return 0;
-		}  		
+		
+		RETRY:
+		if (__sync_add_and_fetch(&high_flows_size[minor], len) > MAX_FLOW_SIZE) {
+			// If there is enough space write, otherwhise wait
+			__sync_sub_and_fetch(&high_flows_size[minor], len);
+			jiffies = wait_event_idle_exclusive_timeout(my_wq[minor][HIGH], 
+								high_flows_size[minor] + len <= MAX_FLOW_SIZE, jiffies);
+			if (jiffies > 0) {
+				// If condition changed and there is some time, retry 
+				goto RETRY;	
+			} else {
+				__sync_fetch_and_sub(&waiting_threads_high[minor], 1);
+				kfree(temp_node);
+				AUDIT { printk(KERN_INFO "[%s][%d][HIGH]: Write - Timeout Expired.\n", MODNAME, minor);}
+				return 0;
+			}
+		}	
 
 		spin_lock(&my_lock[minor][HIGH]);
 			list_add_tail(&temp_node->list, &flow[minor][HIGH]);
 		spin_unlock(&my_lock[minor][HIGH]);	
-		
-		__sync_fetch_and_add(&high_flows_size[minor], len);		
+				
 		__sync_fetch_and_sub(&waiting_threads_high[minor], 1);			
 		wake_up(&my_wq[minor][HIGH]);
 		
@@ -246,10 +265,11 @@ static ssize_t mydev_read(struct file *filp, char __user *buff, size_t len, loff
 		__sync_fetch_and_add(&waiting_threads_low[minor], 1);
 		if (wait_event_idle_exclusive_timeout(my_wq[minor][LOW], low_flows_size[minor] > 0, timeout[minor]) == 0) {
 			// If timeout expires read nothing
+			AUDIT { printk(KERN_INFO "[%s][%d][LOW]: Read - Timeout Expired.\n", MODNAME, minor);}
 			__sync_fetch_and_sub(&waiting_threads_low[minor], 1);
 			return 0;
-		}  
-		
+		}
+			
 		spin_lock(&my_lock[minor][LOW]);
     			temp_node = list_first_entry(&flow[minor][LOW], struct node, list);    			
     			list_del(&temp_node->list);
@@ -257,7 +277,7 @@ static ssize_t mydev_read(struct file *filp, char __user *buff, size_t len, loff
     		
     		__sync_fetch_and_sub(&low_flows_size[minor], strlen(temp_node->data));
     		__sync_fetch_and_sub(&waiting_threads_low[minor], 1);
-		wake_up(&my_wq[minor][LOW]); 
+		wake_up_all(&my_wq[minor][LOW]); 
     		
 		AUDIT { printk(KERN_INFO "[%s][%d][LOW]: Read %s.\n", MODNAME, minor, (char *) temp_node->data); }
 	
@@ -265,6 +285,7 @@ static ssize_t mydev_read(struct file *filp, char __user *buff, size_t len, loff
 		__sync_fetch_and_add(&waiting_threads_high[minor], 1);
 		if (wait_event_idle_exclusive_timeout(my_wq[minor][HIGH], high_flows_size[minor] > 0, timeout[minor]) == 0) {
 			// If timeout expires read nothing
+			AUDIT { printk(KERN_INFO "[%s][%d][HIGH]: Read - Timeout Expired.\n", MODNAME, minor);}
 			__sync_fetch_and_sub(&waiting_threads_high[minor], 1);
 			return 0;
 		}  
@@ -276,7 +297,7 @@ static ssize_t mydev_read(struct file *filp, char __user *buff, size_t len, loff
     		    		
     		__sync_fetch_and_sub(&high_flows_size[minor], strlen(temp_node->data));
     		__sync_fetch_and_sub(&waiting_threads_high[minor], 1);
-   		wake_up(&my_wq[minor][HIGH]); 
+   		wake_up_all(&my_wq[minor][HIGH]); 
    		
     		AUDIT { printk(KERN_INFO "[%s][%d][HIGH]: Read %s.\n", MODNAME, minor, (char *) temp_node->data); }
 
@@ -417,4 +438,4 @@ void cleanup_module(void) {
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Domenico Verde");
 MODULE_DESCRIPTION("SOA Academic Project 21/22. A Multi-Flow Device File");
-MODULE_VERSION("2.0");
+MODULE_VERSION("3.0");

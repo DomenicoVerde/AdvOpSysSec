@@ -11,6 +11,7 @@
 #define THREADS 600
 #define DEVICES 128
 #define PROBABILITY 50
+#define MAX_SIZE 100
 
 void *reader_function(void *tid) {
 /* Read Function for a Thread 
@@ -27,8 +28,8 @@ void *reader_function(void *tid) {
 	}
 	
 	// Read a Segment from it
-	char data[16] = "";
-	int ret = read(fd, data, 16);
+	char data[MAX_SIZE] = "";
+	int ret = read(fd, data, MAX_SIZE);
 	if (ret < 0) {
 		printf ("Error reading from device %s: %s\n", device, strerror(errno));
 		pthread_exit(NULL);
@@ -59,7 +60,7 @@ void *writer_function(void *tid) {
 	// Write a Segment on it
 	char *data;
 	asprintf(&data,"thread %ld\n", (long) tid);
-	int ret = write(fd, data, 16);
+	int ret = write(fd, data, strlen(data));
 	if (ret < 0) {
 		printf ("Error writing to device %s: %s\n", device, strerror(errno));
 		pthread_exit(NULL);
