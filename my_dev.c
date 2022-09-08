@@ -109,8 +109,9 @@ void my_write_handler(struct work_struct * work) {
 
 	RETRY:
 	if (__sync_add_and_fetch(&low_flows_size[minor], len) > MAX_FLOW_SIZE) {
-		// If there is not enough space, wait
+		// If there is not enough space for you write, otherwhise wake up another thread and wait
 		__sync_sub_and_fetch(&low_flows_size[minor], len);
+		wake_up(&my_wq[minor][LOW]);
 		wait_event_idle_exclusive(my_wq[minor][LOW], low_flows_size[minor] + len <= MAX_FLOW_SIZE);
 		goto RETRY;
 	}
@@ -217,8 +218,9 @@ static ssize_t mydev_write(struct file *filp, const char __user *buff, size_t le
 		
 		RETRY:
 		if (__sync_add_and_fetch(&high_flows_size[minor], len) > MAX_FLOW_SIZE) {
-			// If there is enough space write, otherwhise wait
+			// If there is enough space for you write, otherwhise wake up another thread and wait
 			__sync_sub_and_fetch(&high_flows_size[minor], len);
+			wake_up(&my_wq[minor][HIGH]);
 			jiffies = wait_event_idle_exclusive_timeout(my_wq[minor][HIGH], 
 								high_flows_size[minor] + len <= MAX_FLOW_SIZE, jiffies);
 			if (jiffies > 0) {
@@ -277,7 +279,7 @@ static ssize_t mydev_read(struct file *filp, char __user *buff, size_t len, loff
     		
     		__sync_fetch_and_sub(&low_flows_size[minor], strlen(temp_node->data));
     		__sync_fetch_and_sub(&waiting_threads_low[minor], 1);
-		wake_up_all(&my_wq[minor][LOW]); 
+		wake_up(&my_wq[minor][LOW]); 
     		
 		AUDIT { printk(KERN_INFO "[%s][%d][LOW]: Read %s.\n", MODNAME, minor, (char *) temp_node->data); }
 	
@@ -297,7 +299,7 @@ static ssize_t mydev_read(struct file *filp, char __user *buff, size_t len, loff
     		    		
     		__sync_fetch_and_sub(&high_flows_size[minor], strlen(temp_node->data));
     		__sync_fetch_and_sub(&waiting_threads_high[minor], 1);
-   		wake_up_all(&my_wq[minor][HIGH]); 
+   		wake_up(&my_wq[minor][HIGH]); 
    		
     		AUDIT { printk(KERN_INFO "[%s][%d][HIGH]: Read %s.\n", MODNAME, minor, (char *) temp_node->data); }
 
