@@ -99,29 +99,16 @@ void my_write_handler(struct work_struct * work) {
 	struct work_data *work_data;
 	struct node *temp_node;
 	int minor;
-	size_t len;
+	
 	work_data = container_of(work, struct work_data, work);
 	temp_node = work_data->temp_node;
 	minor = work_data->minor;
-	len = strlen(temp_node->data);
-
-	__sync_fetch_and_add(&waiting_threads_low[minor], 1);
-
-	RETRY:
-	if (__sync_add_and_fetch(&low_flows_size[minor], len) > MAX_FLOW_SIZE) {
-		// If there is not enough space for you write, otherwhise wake up another thread and wait
-		__sync_sub_and_fetch(&low_flows_size[minor], len);
-		wake_up(&my_wq[minor][LOW]);
-		wait_event_idle_exclusive(my_wq[minor][LOW], low_flows_size[minor] + len <= MAX_FLOW_SIZE);
-		goto RETRY;
-	}
 
 	spin_lock(&my_lock[minor][LOW]);
 		list_add_tail(&temp_node->list, &flow[minor][LOW]);
 	spin_unlock(&my_lock[minor][LOW]);
 			
 	__sync_fetch_and_sub(&waiting_threads_low[minor], 1);
-	wake_up(&my_wq[minor][LOW]);
 	
 	AUDIT { printk(KERN_INFO "[%s][%d][LOW]: Written %s.\n", MODNAME,  minor, (char *) temp_node->data); }
 }
@@ -207,7 +194,21 @@ static ssize_t mydev_write(struct file *filp, const char __user *buff, size_t le
 		my_work->temp_node = temp_node;
 		my_work->minor = minor;
 		
+		__sync_fetch_and_add(&waiting_threads_low[minor], 1);	
+		
+	ASYNC_RETRY:
+	// This serializes all the async write operations in multithreaded scenarios
+		if (__sync_add_and_fetch(&low_flows_size[minor], len) > MAX_FLOW_SIZE) {
+			// If there is not enough space for your write, wait and retry
+			__sync_sub_and_fetch(&low_flows_size[minor], len);
+			wake_up(&my_wq[minor][LOW]);
+			wait_event_idle_exclusive(my_wq[minor][LOW], low_flows_size[minor] + len <= MAX_FLOW_SIZE);
+			goto ASYNC_RETRY;
+		}
+		// else schedule the op in deferred work
 		queue_work(my_workqueue, &my_work->work);
+		wake_up(&my_wq[minor][LOW]);
+		
 		AUDIT { printk(KERN_INFO "[%s][%d][LOW]: Write Deferred - %s.\n", MODNAME,  minor, (char *) temp_node->data); }		
 		
 		return len;
@@ -216,16 +217,17 @@ static ssize_t mydev_write(struct file *filp, const char __user *buff, size_t le
 		// Synchronous Write Op	
 		__sync_fetch_and_add(&waiting_threads_high[minor], 1);
 		
-		RETRY:
+	SYNC_RETRY:
+	// This serializes all the sync write operations in multithreaded scenarios
 		if (__sync_add_and_fetch(&high_flows_size[minor], len) > MAX_FLOW_SIZE) {
-			// If there is enough space for you write, otherwhise wake up another thread and wait
+			// If there is not enough space for your write, wait and retry till timeout expires
 			__sync_sub_and_fetch(&high_flows_size[minor], len);
 			wake_up(&my_wq[minor][HIGH]);
 			jiffies = wait_event_idle_exclusive_timeout(my_wq[minor][HIGH], 
 								high_flows_size[minor] + len <= MAX_FLOW_SIZE, jiffies);
 			if (jiffies > 0) {
-				// If condition changed and there is some time, retry 
-				goto RETRY;	
+				// If wait queue condition changed and there is sufficient time, retry 
+				goto SYNC_RETRY;	
 			} else {
 				__sync_fetch_and_sub(&waiting_threads_high[minor], 1);
 				kfree(temp_node);
@@ -273,15 +275,23 @@ static ssize_t mydev_read(struct file *filp, char __user *buff, size_t len, loff
 		}
 			
 		spin_lock(&my_lock[minor][LOW]);
-    			temp_node = list_first_entry(&flow[minor][LOW], struct node, list);    			
-    			list_del(&temp_node->list);
+    			temp_node = list_first_entry_or_null(&flow[minor][LOW], struct node, list);
+    			if (temp_node != NULL)			
+    				list_del(&temp_node->list);
     		spin_unlock(&my_lock[minor][LOW]);	
     		
-    		__sync_fetch_and_sub(&low_flows_size[minor], strlen(temp_node->data));
     		__sync_fetch_and_sub(&waiting_threads_low[minor], 1);
 		wake_up(&my_wq[minor][LOW]); 
     		
+    		if (temp_node == NULL) {
+    			// Data cannot be immediately available because of deferred work
+    			AUDIT { printk(KERN_INFO "[%s][%d][LOW]: Read - Data not yet Available.\n", MODNAME, minor); }
+    			return 0;
+    		}
+    		
+    		__sync_fetch_and_sub(&low_flows_size[minor], strlen(temp_node->data));
 		AUDIT { printk(KERN_INFO "[%s][%d][LOW]: Read %s.\n", MODNAME, minor, (char *) temp_node->data); }
+		
 	
 	} else if (priority[minor] == HIGH) {
 		__sync_fetch_and_add(&waiting_threads_high[minor], 1);
@@ -419,7 +429,7 @@ int init_module(void) {
 		waiting_threads_low[i] 	= 0;		
 		waiting_threads_high[i] = 0;
 		
-		timeout[i] = 4 * HZ;
+		timeout[i] = 2 * HZ;
 		priority[i] = LOW;
 		i++;
 	}
@@ -440,4 +450,4 @@ void cleanup_module(void) {
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Domenico Verde");
 MODULE_DESCRIPTION("SOA Academic Project 21/22. A Multi-Flow Device File");
-MODULE_VERSION("3.0");
+MODULE_VERSION("4.0");
